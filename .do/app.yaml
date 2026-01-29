@@ -5,7 +5,7 @@ services:
   - name: api
     dockerfile_path: Dockerfile
     github:
-      repo: YOUR_GITHUB_USERNAME/cfdi-verifier
+      repo: 99labs-ai/cfdi-verifier
       branch: main
       deploy_on_push: true
     instance_size_slug: professional-xs
@@ -30,7 +30,7 @@ services:
   - name: worker
     dockerfile_path: Dockerfile
     github:
-      repo: YOUR_GITHUB_USERNAME/cfdi-verifier
+      repo: 99labs-ai/cfdi-verifier
       branch: main
       deploy_on_push: true
     instance_size_slug: professional-xs
