@@ -10,7 +10,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN playwright install chromium
 
 # Copy application code
-COPY api.py celery_app.py tasks.py ./
+COPY api.py celery_app.py tasks.py database.py models.py ./
 
 # Expose port
 EXPOSE 8000

@@ -7,6 +7,7 @@ Supports both XML upload and Folio Fiscal data input methods.
 
 import asyncio
 import base64
+import hashlib
 import logging
 import os
 import tempfile
@@ -20,12 +21,15 @@ import httpx
 from celery import group, chord
 from celery.result import AsyncResult, GroupResult
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
 from pydantic import BaseModel
 from playwright.async_api import async_playwright
+from sqlalchemy.orm import Session
 from twocaptcha import TwoCaptcha
 
 from celery_app import celery_app
+from database import get_db, init_db, SessionLocal
+from models import Verification, Batch, VerificationStatus, VerificationMethod
 from tasks import verify_folio_task, verify_xml_task, batch_complete_callback
 
 # Setup logging
@@ -41,10 +45,19 @@ load_dotenv(Path(__file__).parent / ".env")
 app = FastAPI(
     title="CFDI Verifier API",
     description="API for verifying Mexican digital tax invoices (CFDI) against SAT",
-    version="2.0.0",
+    version="3.0.0",
 )
 
-# In-memory job storage (use Redis/DB in production)
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize database on startup."""
+    logger.info("Initializing database...")
+    init_db()
+    logger.info("Database initialized")
+
+
+# In-memory job storage (kept for backwards compatibility, DB is primary)
 jobs: dict[str, dict] = {}
 
 
@@ -485,7 +498,7 @@ class VerifyFolioResponse(BaseModel):
 
 
 @app.post("/verify/folio", response_model=VerifyFolioResponse, tags=["Verification"])
-async def verify_by_folio_sync(request: VerifyFolioRequest):
+async def verify_by_folio_sync(request: VerifyFolioRequest, db: Session = Depends(get_db)):
     """
     Verify CFDI using Folio Fiscal data (synchronous - waits for result).
 
@@ -493,10 +506,25 @@ async def verify_by_folio_sync(request: VerifyFolioRequest):
     - **id**: Folio Fiscal (UUID)
     - **re**: RFC Emisor
     - **rr**: RFC Receptor
-    - **tt**: Total amount
 
     Returns the verification result directly (takes ~20-40 seconds).
     """
+    job_id = str(uuid.uuid4())
+
+    # Create DB record
+    db_verification = Verification(
+        job_id=job_id,
+        method=VerificationMethod.FOLIO,
+        folio_fiscal=request.id,
+        rfc_emisor=request.re,
+        rfc_receptor=request.rr,
+        webhook_url=request.webhook_url,
+        status=VerificationStatus.PROCESSING,
+        started_at=datetime.utcnow()
+    )
+    db.add(db_verification)
+    db.commit()
+
     try:
         result = await verify_by_folio(
             request.id,
@@ -506,32 +534,50 @@ async def verify_by_folio_sync(request: VerifyFolioRequest):
             request.max_retries
         )
 
+        # Update DB record
+        db_verification.status = VerificationStatus.COMPLETED
+        db_verification.valid = result.get("valid", False)
+        db_verification.sat_response = result
+        db_verification.completed_at = datetime.utcnow()
+        db.commit()
+
         # Send webhook if configured
         if request.webhook_url:
-            await send_webhook(request.webhook_url, "sync", {
+            await send_webhook(request.webhook_url, job_id, {
                 "status": "completed",
-                "created_at": datetime.utcnow().isoformat(),
-                "completed_at": datetime.utcnow().isoformat(),
+                "created_at": db_verification.created_at.isoformat(),
+                "completed_at": db_verification.completed_at.isoformat(),
                 "result": result,
                 "error": None
             })
+            db_verification.webhook_sent = True
+            db.commit()
 
         return VerifyFolioResponse(**result)
 
     except Exception as e:
+        # Update DB record with error
+        db_verification.status = VerificationStatus.FAILED
+        db_verification.error_message = str(e)
+        db_verification.completed_at = datetime.utcnow()
+        db.commit()
+
         if request.webhook_url:
-            await send_webhook(request.webhook_url, "sync", {
+            await send_webhook(request.webhook_url, job_id, {
                 "status": "failed",
-                "created_at": datetime.utcnow().isoformat(),
-                "completed_at": datetime.utcnow().isoformat(),
+                "created_at": db_verification.created_at.isoformat(),
+                "completed_at": db_verification.completed_at.isoformat(),
                 "result": None,
                 "error": str(e)
             })
+            db_verification.webhook_sent = True
+            db.commit()
+
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/verify/folio/async", response_model=JobResponse, tags=["Verification"])
-async def verify_by_folio_async(request: VerifyFolioRequest, background_tasks: BackgroundTasks):
+async def verify_by_folio_async(request: VerifyFolioRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     """
     Verify CFDI using Folio Fiscal data (async - returns job_id immediately).
 
@@ -539,9 +585,25 @@ async def verify_by_folio_async(request: VerifyFolioRequest, background_tasks: B
     Poll /jobs/{job_id} for results or provide webhook_url.
     """
     job_id = str(uuid.uuid4())
+    created_at = datetime.utcnow()
+
+    # Create DB record
+    db_verification = Verification(
+        job_id=job_id,
+        method=VerificationMethod.FOLIO,
+        folio_fiscal=request.id,
+        rfc_emisor=request.re,
+        rfc_receptor=request.rr,
+        webhook_url=request.webhook_url,
+        status=VerificationStatus.PENDING
+    )
+    db.add(db_verification)
+    db.commit()
+
+    # Keep in-memory for backwards compatibility
     jobs[job_id] = {
         "status": JobStatus.PENDING,
-        "created_at": datetime.utcnow().isoformat(),
+        "created_at": created_at.isoformat(),
         "method": "folio",
         "result": None,
         "error": None,
@@ -562,13 +624,13 @@ async def verify_by_folio_async(request: VerifyFolioRequest, background_tasks: B
     return JobResponse(
         job_id=job_id,
         status=JobStatus.PENDING,
-        created_at=jobs[job_id]["created_at"],
+        created_at=created_at.isoformat(),
         message="Verification job created. Poll /jobs/{job_id} for results."
     )
 
 
 @app.post("/verify/xml", response_model=VerifyFolioResponse, tags=["Verification"])
-async def verify_by_xml_sync(request: VerifyXMLRequest):
+async def verify_by_xml_sync(request: VerifyXMLRequest, db: Session = Depends(get_db)):
     """
     Verify CFDI by uploading XML content (synchronous - waits for result).
 
@@ -585,29 +647,64 @@ async def verify_by_xml_sync(request: VerifyXMLRequest):
     if not xml_content:
         raise HTTPException(status_code=400, detail="xml_content or xml_base64 required")
 
+    job_id = str(uuid.uuid4())
+    xml_hash = hashlib.sha256(xml_content.encode()).hexdigest()
+
+    # Create DB record
+    db_verification = Verification(
+        job_id=job_id,
+        method=VerificationMethod.XML,
+        xml_hash=xml_hash,
+        webhook_url=request.webhook_url,
+        status=VerificationStatus.PROCESSING,
+        started_at=datetime.utcnow()
+    )
+    db.add(db_verification)
+    db.commit()
+
     try:
         result = await verify_by_xml(xml_content, request.max_retries)
 
+        # Update DB record
+        db_verification.status = VerificationStatus.COMPLETED
+        db_verification.valid = result.get("valid", False)
+        db_verification.sat_response = result
+        db_verification.folio_fiscal = result.get("folio_fiscal")
+        db_verification.rfc_emisor = result.get("rfc_emisor")
+        db_verification.rfc_receptor = result.get("rfc_receptor")
+        db_verification.completed_at = datetime.utcnow()
+        db.commit()
+
         if request.webhook_url:
-            await send_webhook(request.webhook_url, "sync", {
+            await send_webhook(request.webhook_url, job_id, {
                 "status": "completed",
-                "created_at": datetime.utcnow().isoformat(),
-                "completed_at": datetime.utcnow().isoformat(),
+                "created_at": db_verification.created_at.isoformat(),
+                "completed_at": db_verification.completed_at.isoformat(),
                 "result": result,
                 "error": None
             })
+            db_verification.webhook_sent = True
+            db.commit()
 
         return VerifyFolioResponse(**result)
 
     except Exception as e:
+        db_verification.status = VerificationStatus.FAILED
+        db_verification.error_message = str(e)
+        db_verification.completed_at = datetime.utcnow()
+        db.commit()
+
         if request.webhook_url:
-            await send_webhook(request.webhook_url, "sync", {
+            await send_webhook(request.webhook_url, job_id, {
                 "status": "failed",
-                "created_at": datetime.utcnow().isoformat(),
-                "completed_at": datetime.utcnow().isoformat(),
+                "created_at": db_verification.created_at.isoformat(),
+                "completed_at": db_verification.completed_at.isoformat(),
                 "result": None,
                 "error": str(e)
             })
+            db_verification.webhook_sent = True
+            db.commit()
+
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -712,7 +809,7 @@ batches: dict[str, dict] = {}
 
 
 @app.post("/batch/verify", response_model=BatchResponse, tags=["Batch"])
-async def create_batch_verification(request: BatchRequest):
+async def create_batch_verification(request: BatchRequest, db: Session = Depends(get_db)):
     """
     Submit a batch of CFDIs for verification.
 
@@ -728,7 +825,33 @@ async def create_batch_verification(request: BatchRequest):
         raise HTTPException(status_code=400, detail="At least 1 item required")
 
     batch_id = str(uuid.uuid4())
-    created_at = datetime.utcnow().isoformat()
+    created_at = datetime.utcnow()
+
+    # Create batch record in DB
+    db_batch = Batch(
+        batch_id=batch_id,
+        total_items=len(request.items),
+        webhook_url=request.webhook_url,
+        status=VerificationStatus.PROCESSING
+    )
+    db.add(db_batch)
+    db.commit()
+    db.refresh(db_batch)
+
+    # Create verification records for each item
+    for i, item in enumerate(request.items):
+        db_verification = Verification(
+            job_id=str(uuid.uuid4()),
+            method=VerificationMethod.FOLIO,
+            folio_fiscal=item.id,
+            rfc_emisor=item.re,
+            rfc_receptor=item.rr,
+            status=VerificationStatus.PENDING,
+            batch_id=db_batch.id,
+            batch_index=i
+        )
+        db.add(db_verification)
+    db.commit()
 
     # Create Celery tasks for each item
     tasks = []
@@ -749,11 +872,15 @@ async def create_batch_verification(request: BatchRequest):
     else:
         job = group(tasks).apply_async()
 
-    # Store batch info
+    # Update batch with Celery group ID
+    db_batch.celery_group_id = job.id
+    db.commit()
+
+    # Store in memory for backwards compatibility
     batches[batch_id] = {
         "group_id": job.id,
         "total": len(request.items),
-        "created_at": created_at,
+        "created_at": created_at.isoformat(),
         "webhook_url": request.webhook_url,
         "items": [{"id": item.id, "re": item.re, "rr": item.rr} for item in request.items]
     }
@@ -764,7 +891,7 @@ async def create_batch_verification(request: BatchRequest):
         batch_id=batch_id,
         total_items=len(request.items),
         status="processing",
-        created_at=created_at,
+        created_at=created_at.isoformat(),
         message=f"Batch created. {len(request.items)} items queued for verification. Poll /batch/{batch_id} for status."
     )
 
@@ -921,6 +1048,125 @@ async def queue_stats():
         }
     except Exception as e:
         return {"error": str(e), "message": "Celery workers may not be running"}
+
+
+@app.get("/history", tags=["History"])
+async def get_verification_history(
+    db: Session = Depends(get_db),
+    limit: int = 50,
+    offset: int = 0,
+    folio_fiscal: Optional[str] = None,
+    rfc_emisor: Optional[str] = None,
+    rfc_receptor: Optional[str] = None,
+    status: Optional[str] = None,
+    valid: Optional[bool] = None
+):
+    """
+    Query verification history from database.
+
+    Supports filtering by:
+    - folio_fiscal: Exact match
+    - rfc_emisor: Exact match
+    - rfc_receptor: Exact match
+    - status: pending, processing, completed, failed
+    - valid: true/false
+    """
+    query = db.query(Verification)
+
+    if folio_fiscal:
+        query = query.filter(Verification.folio_fiscal == folio_fiscal)
+    if rfc_emisor:
+        query = query.filter(Verification.rfc_emisor == rfc_emisor)
+    if rfc_receptor:
+        query = query.filter(Verification.rfc_receptor == rfc_receptor)
+    if status:
+        query = query.filter(Verification.status == status)
+    if valid is not None:
+        query = query.filter(Verification.valid == valid)
+
+    total = query.count()
+    verifications = query.order_by(Verification.created_at.desc()).offset(offset).limit(limit).all()
+
+    return {
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "results": [
+            {
+                "job_id": v.job_id,
+                "folio_fiscal": v.folio_fiscal,
+                "rfc_emisor": v.rfc_emisor,
+                "rfc_receptor": v.rfc_receptor,
+                "method": v.method.value if v.method else None,
+                "status": v.status.value if v.status else None,
+                "valid": v.valid,
+                "sat_response": v.sat_response,
+                "error_message": v.error_message,
+                "created_at": v.created_at.isoformat() if v.created_at else None,
+                "completed_at": v.completed_at.isoformat() if v.completed_at else None,
+            }
+            for v in verifications
+        ]
+    }
+
+
+@app.get("/history/{job_id}", tags=["History"])
+async def get_verification_by_job_id(job_id: str, db: Session = Depends(get_db)):
+    """Get a specific verification by job_id."""
+    verification = db.query(Verification).filter(Verification.job_id == job_id).first()
+
+    if not verification:
+        raise HTTPException(status_code=404, detail="Verification not found")
+
+    return {
+        "job_id": verification.job_id,
+        "folio_fiscal": verification.folio_fiscal,
+        "rfc_emisor": verification.rfc_emisor,
+        "rfc_receptor": verification.rfc_receptor,
+        "method": verification.method.value if verification.method else None,
+        "status": verification.status.value if verification.status else None,
+        "valid": verification.valid,
+        "sat_response": verification.sat_response,
+        "error_message": verification.error_message,
+        "webhook_url": verification.webhook_url,
+        "webhook_sent": verification.webhook_sent,
+        "batch_id": verification.batch.batch_id if verification.batch else None,
+        "created_at": verification.created_at.isoformat() if verification.created_at else None,
+        "started_at": verification.started_at.isoformat() if verification.started_at else None,
+        "completed_at": verification.completed_at.isoformat() if verification.completed_at else None,
+    }
+
+
+@app.get("/stats", tags=["System"])
+async def get_stats(db: Session = Depends(get_db)):
+    """Get verification statistics."""
+    total = db.query(Verification).count()
+    completed = db.query(Verification).filter(Verification.status == VerificationStatus.COMPLETED).count()
+    failed = db.query(Verification).filter(Verification.status == VerificationStatus.FAILED).count()
+    pending = db.query(Verification).filter(Verification.status == VerificationStatus.PENDING).count()
+    processing = db.query(Verification).filter(Verification.status == VerificationStatus.PROCESSING).count()
+
+    valid_count = db.query(Verification).filter(Verification.valid == True).count()
+    invalid_count = db.query(Verification).filter(Verification.valid == False).count()
+
+    total_batches = db.query(Batch).count()
+
+    return {
+        "verifications": {
+            "total": total,
+            "completed": completed,
+            "failed": failed,
+            "pending": pending,
+            "processing": processing,
+        },
+        "results": {
+            "valid": valid_count,
+            "invalid": invalid_count,
+        },
+        "batches": {
+            "total": total_batches,
+        }
+    }
 
 
 @app.get("/health", tags=["System"])
