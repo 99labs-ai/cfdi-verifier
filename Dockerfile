@@ -11,7 +11,6 @@ RUN playwright install chromium
 
 # Copy application code
 COPY api.py .
-COPY .env* ./
 
 # Expose port
 EXPOSE 8000
