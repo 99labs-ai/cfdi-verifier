@@ -442,38 +442,151 @@ async def process_folio_job(job_id: str, folio: str, rfc_e: str, rfc_r: str, tot
     """Background task for Folio verification."""
     jobs[job_id]["status"] = JobStatus.PROCESSING
 
+    # Update DB status to processing
+    db = SessionLocal()
+    try:
+        db_verification = db.query(Verification).filter(Verification.job_id == job_id).first()
+        if db_verification:
+            db_verification.status = VerificationStatus.PROCESSING
+            db_verification.started_at = datetime.utcnow()
+            db.commit()
+    except Exception as e:
+        logger.error(f"DB error updating status to processing: {e}")
+    finally:
+        db.close()
+
     try:
         result = await verify_by_folio(folio, rfc_e, rfc_r, total, max_retries)
         jobs[job_id]["status"] = JobStatus.COMPLETED
         jobs[job_id]["result"] = result
         jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()
+
+        # Update DB with success
+        db = SessionLocal()
+        try:
+            db_verification = db.query(Verification).filter(Verification.job_id == job_id).first()
+            if db_verification:
+                db_verification.status = VerificationStatus.COMPLETED
+                db_verification.valid = result.get("valid", False)
+                db_verification.sat_response = result
+                db_verification.completed_at = datetime.utcnow()
+                db.commit()
+        except Exception as e:
+            logger.error(f"DB error saving result: {e}")
+        finally:
+            db.close()
+
     except Exception as e:
         jobs[job_id]["status"] = JobStatus.FAILED
         jobs[job_id]["error"] = str(e)
         jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()
 
+        # Update DB with failure
+        db = SessionLocal()
+        try:
+            db_verification = db.query(Verification).filter(Verification.job_id == job_id).first()
+            if db_verification:
+                db_verification.status = VerificationStatus.FAILED
+                db_verification.error_message = str(e)
+                db_verification.completed_at = datetime.utcnow()
+                db.commit()
+        except Exception as db_err:
+            logger.error(f"DB error saving failure: {db_err}")
+        finally:
+            db.close()
+
     # Send webhook if configured
     if webhook_url:
         await send_webhook(webhook_url, job_id, jobs[job_id])
+
+        # Update webhook_sent in DB
+        db = SessionLocal()
+        try:
+            db_verification = db.query(Verification).filter(Verification.job_id == job_id).first()
+            if db_verification:
+                db_verification.webhook_sent = True
+                db.commit()
+        except Exception as e:
+            logger.error(f"DB error updating webhook_sent: {e}")
+        finally:
+            db.close()
 
 
 async def process_xml_job(job_id: str, xml_content: str, webhook_url: Optional[str], max_retries: int):
     """Background task for XML verification."""
     jobs[job_id]["status"] = JobStatus.PROCESSING
 
+    # Update DB status to processing
+    db = SessionLocal()
+    try:
+        db_verification = db.query(Verification).filter(Verification.job_id == job_id).first()
+        if db_verification:
+            db_verification.status = VerificationStatus.PROCESSING
+            db_verification.started_at = datetime.utcnow()
+            db.commit()
+    except Exception as e:
+        logger.error(f"DB error updating status to processing: {e}")
+    finally:
+        db.close()
+
     try:
         result = await verify_by_xml(xml_content, max_retries)
         jobs[job_id]["status"] = JobStatus.COMPLETED
         jobs[job_id]["result"] = result
         jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()
+
+        # Update DB with success
+        db = SessionLocal()
+        try:
+            db_verification = db.query(Verification).filter(Verification.job_id == job_id).first()
+            if db_verification:
+                db_verification.status = VerificationStatus.COMPLETED
+                db_verification.valid = result.get("valid", False)
+                db_verification.sat_response = result
+                db_verification.folio_fiscal = result.get("folio_fiscal")
+                db_verification.rfc_emisor = result.get("rfc_emisor")
+                db_verification.rfc_receptor = result.get("rfc_receptor")
+                db_verification.completed_at = datetime.utcnow()
+                db.commit()
+        except Exception as e:
+            logger.error(f"DB error saving result: {e}")
+        finally:
+            db.close()
+
     except Exception as e:
         jobs[job_id]["status"] = JobStatus.FAILED
         jobs[job_id]["error"] = str(e)
         jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()
 
+        # Update DB with failure
+        db = SessionLocal()
+        try:
+            db_verification = db.query(Verification).filter(Verification.job_id == job_id).first()
+            if db_verification:
+                db_verification.status = VerificationStatus.FAILED
+                db_verification.error_message = str(e)
+                db_verification.completed_at = datetime.utcnow()
+                db.commit()
+        except Exception as db_err:
+            logger.error(f"DB error saving failure: {db_err}")
+        finally:
+            db.close()
+
     # Send webhook if configured
     if webhook_url:
         await send_webhook(webhook_url, job_id, jobs[job_id])
+
+        # Update webhook_sent in DB
+        db = SessionLocal()
+        try:
+            db_verification = db.query(Verification).filter(Verification.job_id == job_id).first()
+            if db_verification:
+                db_verification.webhook_sent = True
+                db.commit()
+        except Exception as e:
+            logger.error(f"DB error updating webhook_sent: {e}")
+        finally:
+            db.close()
 
 
 # ---------- API Endpoints ----------

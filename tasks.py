@@ -6,6 +6,7 @@ import base64
 import logging
 import os
 import tempfile
+from datetime import datetime
 from pathlib import Path
 
 import httpx
@@ -13,9 +14,58 @@ from playwright.sync_api import sync_playwright
 from twocaptcha import TwoCaptcha
 
 from celery_app import celery_app
+from database import SessionLocal
+from models import Verification, Batch, VerificationStatus
 
 logger = logging.getLogger("cfdi-tasks")
 logging.basicConfig(level=logging.INFO)
+
+
+def update_verification_status(batch_id: str, item_index: int, status: VerificationStatus,
+                                result: dict = None, error: str = None):
+    """Update verification record in database."""
+    db = SessionLocal()
+    try:
+        # Find the batch first
+        db_batch = db.query(Batch).filter(Batch.batch_id == batch_id).first()
+        if db_batch:
+            # Find the verification by batch_id and index
+            db_verification = db.query(Verification).filter(
+                Verification.batch_id == db_batch.id,
+                Verification.batch_index == item_index
+            ).first()
+
+            if db_verification:
+                db_verification.status = status
+                if status == VerificationStatus.PROCESSING:
+                    db_verification.started_at = datetime.utcnow()
+                elif status in [VerificationStatus.COMPLETED, VerificationStatus.FAILED]:
+                    db_verification.completed_at = datetime.utcnow()
+
+                if result:
+                    db_verification.valid = result.get("valid", False)
+                    db_verification.sat_response = result
+                if error:
+                    db_verification.error_message = error
+
+                # Update batch counts
+                if status == VerificationStatus.COMPLETED:
+                    db_batch.completed_count += 1
+                elif status == VerificationStatus.FAILED:
+                    db_batch.failed_count += 1
+
+                # Check if batch is complete
+                if db_batch.completed_count + db_batch.failed_count >= db_batch.total_items:
+                    db_batch.status = VerificationStatus.COMPLETED
+                    db_batch.completed_at = datetime.utcnow()
+
+                db.commit()
+                logger.info(f"Updated verification for batch {batch_id}, item {item_index}: {status}")
+    except Exception as e:
+        logger.error(f"DB error updating verification: {e}")
+        db.rollback()
+    finally:
+        db.close()
 
 
 def solve_captcha_sync(image_bytes: bytes) -> str:
@@ -118,6 +168,10 @@ def verify_folio_task(self, folio_fiscal: str, rfc_emisor: str, rfc_receptor: st
     """
     logger.info(f"Starting verification for folio: {folio_fiscal}")
 
+    # Update DB status to processing
+    if batch_id is not None and item_index is not None:
+        update_verification_status(batch_id, item_index, VerificationStatus.PROCESSING)
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
@@ -151,6 +205,10 @@ def verify_folio_task(self, folio_fiscal: str, rfc_emisor: str, rfc_receptor: st
                     results = extract_results_sync(page)
                     browser.close()
 
+                    # Update DB with success
+                    if batch_id is not None and item_index is not None:
+                        update_verification_status(batch_id, item_index, VerificationStatus.COMPLETED, result=results)
+
                     # Send webhook if configured
                     if webhook_url:
                         send_webhook_sync(webhook_url, {
@@ -171,6 +229,11 @@ def verify_folio_task(self, folio_fiscal: str, rfc_emisor: str, rfc_receptor: st
                 else:
                     results = extract_results_sync(page)
                     browser.close()
+
+                    # Update DB with results
+                    if batch_id is not None and item_index is not None:
+                        update_verification_status(batch_id, item_index, VerificationStatus.COMPLETED, result=results)
+
                     return results
 
             except Exception as e:
@@ -178,8 +241,17 @@ def verify_folio_task(self, folio_fiscal: str, rfc_emisor: str, rfc_receptor: st
                 if attempt < max_captcha_retries - 1:
                     page.reload()
                     continue
+
+                # Update DB with failure
+                if batch_id is not None and item_index is not None:
+                    update_verification_status(batch_id, item_index, VerificationStatus.FAILED, error=str(e))
+
                 browser.close()
                 raise self.retry(exc=e, countdown=5)
+
+        # Update DB with failure after all retries
+        if batch_id is not None and item_index is not None:
+            update_verification_status(batch_id, item_index, VerificationStatus.FAILED, error="Failed after max CAPTCHA attempts")
 
         browser.close()
         raise Exception(f"Failed after {max_captcha_retries} CAPTCHA attempts")
@@ -190,6 +262,10 @@ def verify_xml_task(self, xml_content: str, webhook_url: str = None,
                     batch_id: str = None, item_index: int = None):
     """Celery task to verify CFDI by XML content."""
     logger.info("Starting XML verification")
+
+    # Update DB status to processing
+    if batch_id is not None and item_index is not None:
+        update_verification_status(batch_id, item_index, VerificationStatus.PROCESSING)
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".xml", delete=False) as f:
         f.write(xml_content)
@@ -229,6 +305,10 @@ def verify_xml_task(self, xml_content: str, webhook_url: str = None,
                         results = extract_results_sync(page)
                         browser.close()
 
+                        # Update DB with success
+                        if batch_id is not None and item_index is not None:
+                            update_verification_status(batch_id, item_index, VerificationStatus.COMPLETED, result=results)
+
                         if webhook_url:
                             send_webhook_sync(webhook_url, {
                                 "type": "item_completed" if batch_id else "completed",
@@ -246,6 +326,11 @@ def verify_xml_task(self, xml_content: str, webhook_url: str = None,
                     else:
                         results = extract_results_sync(page)
                         browser.close()
+
+                        # Update DB with results
+                        if batch_id is not None and item_index is not None:
+                            update_verification_status(batch_id, item_index, VerificationStatus.COMPLETED, result=results)
+
                         return results
 
                 except Exception as e:
@@ -253,8 +338,17 @@ def verify_xml_task(self, xml_content: str, webhook_url: str = None,
                     if attempt < max_captcha_retries - 1:
                         page.reload()
                         continue
+
+                    # Update DB with failure
+                    if batch_id is not None and item_index is not None:
+                        update_verification_status(batch_id, item_index, VerificationStatus.FAILED, error=str(e))
+
                     browser.close()
                     raise self.retry(exc=e, countdown=5)
+
+            # Update DB with failure after all retries
+            if batch_id is not None and item_index is not None:
+                update_verification_status(batch_id, item_index, VerificationStatus.FAILED, error="Failed after max CAPTCHA attempts")
 
             browser.close()
             raise Exception(f"Failed after {max_captcha_retries} attempts")
@@ -267,6 +361,23 @@ def verify_xml_task(self, xml_content: str, webhook_url: str = None,
 def batch_complete_callback(results: list, batch_id: str, webhook_url: str = None):
     """Called when all items in a batch are complete."""
     logger.info(f"Batch {batch_id} complete with {len(results)} results")
+
+    # Update batch webhook_sent status in DB
+    db = SessionLocal()
+    try:
+        db_batch = db.query(Batch).filter(Batch.batch_id == batch_id).first()
+        if db_batch:
+            db_batch.status = VerificationStatus.COMPLETED
+            db_batch.completed_at = datetime.utcnow()
+
+            if webhook_url:
+                db_batch.webhook_sent = True
+
+            db.commit()
+    except Exception as e:
+        logger.error(f"DB error updating batch: {e}")
+    finally:
+        db.close()
 
     if webhook_url:
         completed = sum(1 for r in results if r and r.get("valid") is not None)
