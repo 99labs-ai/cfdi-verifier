@@ -1,12 +1,28 @@
 version: '3.8'
 
 services:
-  cfdi-verifier:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  api:
     build: .
     ports:
       - "8000:8000"
     environment:
       - TWOCAPTCHA_API_KEY=${TWOCAPTCHA_API_KEY}
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -14,3 +30,21 @@ services:
       timeout: 10s
       retries: 3
       start_period: 10s
+
+  worker:
+    build: .
+    command: celery -A celery_app worker --loglevel=info --concurrency=3
+    environment:
+      - TWOCAPTCHA_API_KEY=${TWOCAPTCHA_API_KEY}
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+volumes:
+  redis_data:

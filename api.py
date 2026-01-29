@@ -14,14 +14,19 @@ import uuid
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 import httpx
+from celery import group, chord
+from celery.result import AsyncResult, GroupResult
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 from playwright.async_api import async_playwright
 from twocaptcha import TwoCaptcha
+
+from celery_app import celery_app
+from tasks import verify_folio_task, verify_xml_task, batch_complete_callback
 
 # Setup logging
 logging.basicConfig(
@@ -93,6 +98,47 @@ class JobResponse(BaseModel):
     status: JobStatus
     created_at: str
     message: str
+
+
+class BatchItem(BaseModel):
+    id: str  # Folio Fiscal
+    re: str  # RFC Emisor
+    rr: str  # RFC Receptor
+
+
+class BatchRequest(BaseModel):
+    items: List[BatchItem]
+    webhook_url: Optional[str] = None
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "items": [
+                    {"id": "9FD4B473-1EE0-42E2-9D29-5DAEC8057A18", "re": "DORA990310A30", "rr": "REGL960120LPA"},
+                    {"id": "ANOTHER-UUID-HERE", "re": "RFC123456789", "rr": "RFC987654321"}
+                ],
+                "webhook_url": "https://your-server.com/webhook"
+            }
+        }
+    }
+
+
+class BatchResponse(BaseModel):
+    batch_id: str
+    total_items: int
+    status: str
+    created_at: str
+    message: str
+
+
+class BatchStatusResponse(BaseModel):
+    batch_id: str
+    status: str
+    total: int
+    completed: int
+    failed: int
+    pending: int
+    results: Optional[List[dict]] = None
 
 
 class JobResult(BaseModel):
@@ -659,10 +705,228 @@ async def delete_job(job_id: str):
     return {"message": "Job deleted"}
 
 
+# ---------- Batch Endpoints (Celery) ----------
+
+# In-memory batch tracking (use Redis in production for persistence)
+batches: dict[str, dict] = {}
+
+
+@app.post("/batch/verify", response_model=BatchResponse, tags=["Batch"])
+async def create_batch_verification(request: BatchRequest):
+    """
+    Submit a batch of CFDIs for verification.
+
+    - Accepts up to 500 items per batch
+    - Items are processed in parallel (3 concurrent workers)
+    - Use /batch/{batch_id} to check progress
+    - Optionally provide webhook_url for completion notification
+    """
+    if len(request.items) > 500:
+        raise HTTPException(status_code=400, detail="Maximum 500 items per batch")
+
+    if len(request.items) == 0:
+        raise HTTPException(status_code=400, detail="At least 1 item required")
+
+    batch_id = str(uuid.uuid4())
+    created_at = datetime.utcnow().isoformat()
+
+    # Create Celery tasks for each item
+    tasks = []
+    for i, item in enumerate(request.items):
+        task = verify_folio_task.s(
+            folio_fiscal=item.id,
+            rfc_emisor=item.re,
+            rfc_receptor=item.rr,
+            webhook_url=request.webhook_url,
+            batch_id=batch_id,
+            item_index=i
+        )
+        tasks.append(task)
+
+    # Use chord: run all tasks in parallel, then call callback when all complete
+    if request.webhook_url:
+        job = chord(tasks)(batch_complete_callback.s(batch_id=batch_id, webhook_url=request.webhook_url))
+    else:
+        job = group(tasks).apply_async()
+
+    # Store batch info
+    batches[batch_id] = {
+        "group_id": job.id,
+        "total": len(request.items),
+        "created_at": created_at,
+        "webhook_url": request.webhook_url,
+        "items": [{"id": item.id, "re": item.re, "rr": item.rr} for item in request.items]
+    }
+
+    logger.info(f"Created batch {batch_id} with {len(request.items)} items")
+
+    return BatchResponse(
+        batch_id=batch_id,
+        total_items=len(request.items),
+        status="processing",
+        created_at=created_at,
+        message=f"Batch created. {len(request.items)} items queued for verification. Poll /batch/{batch_id} for status."
+    )
+
+
+@app.get("/batch/{batch_id}", response_model=BatchStatusResponse, tags=["Batch"])
+async def get_batch_status(batch_id: str, include_results: bool = False):
+    """
+    Get the status of a batch verification job.
+
+    - Set include_results=true to get individual results (only when completed)
+    """
+    if batch_id not in batches:
+        raise HTTPException(status_code=404, detail="Batch not found")
+
+    batch = batches[batch_id]
+    group_result = GroupResult.restore(batch["group_id"], app=celery_app)
+
+    if group_result is None:
+        # Try as AsyncResult (for chord)
+        async_result = AsyncResult(batch["group_id"], app=celery_app)
+        if async_result.ready():
+            results = async_result.result
+            if isinstance(results, dict) and "results" in results:
+                # Chord callback result
+                all_results = results["results"]
+                completed = sum(1 for r in all_results if r and r.get("valid") is not None)
+                failed = len(all_results) - completed
+
+                return BatchStatusResponse(
+                    batch_id=batch_id,
+                    status="completed",
+                    total=batch["total"],
+                    completed=completed,
+                    failed=failed,
+                    pending=0,
+                    results=all_results if include_results else None
+                )
+
+        return BatchStatusResponse(
+            batch_id=batch_id,
+            status="processing",
+            total=batch["total"],
+            completed=0,
+            failed=0,
+            pending=batch["total"],
+            results=None
+        )
+
+    # Count completed/failed/pending
+    completed = 0
+    failed = 0
+    results_list = []
+
+    for result in group_result.results:
+        if result.ready():
+            if result.successful():
+                completed += 1
+                if include_results:
+                    results_list.append(result.result)
+            else:
+                failed += 1
+                if include_results:
+                    results_list.append({"error": str(result.result)})
+        else:
+            if include_results:
+                results_list.append(None)
+
+    pending = batch["total"] - completed - failed
+
+    if pending == 0:
+        status = "completed"
+    elif completed + failed > 0:
+        status = "processing"
+    else:
+        status = "pending"
+
+    return BatchStatusResponse(
+        batch_id=batch_id,
+        status=status,
+        total=batch["total"],
+        completed=completed,
+        failed=failed,
+        pending=pending,
+        results=results_list if include_results and status == "completed" else None
+    )
+
+
+@app.get("/batch", tags=["Batch"])
+async def list_batches(limit: int = 10):
+    """List recent batches."""
+    sorted_batches = sorted(
+        batches.items(),
+        key=lambda x: x[1]["created_at"],
+        reverse=True
+    )[:limit]
+
+    result = []
+    for batch_id, batch in sorted_batches:
+        # Get quick status
+        group_result = GroupResult.restore(batch["group_id"], app=celery_app)
+        if group_result:
+            completed = sum(1 for r in group_result.results if r.ready() and r.successful())
+            pending = batch["total"] - completed
+            status = "completed" if pending == 0 else "processing"
+        else:
+            status = "processing"
+            completed = 0
+
+        result.append({
+            "batch_id": batch_id,
+            "total": batch["total"],
+            "completed": completed,
+            "status": status,
+            "created_at": batch["created_at"],
+        })
+
+    return result
+
+
+@app.delete("/batch/{batch_id}", tags=["Batch"])
+async def cancel_batch(batch_id: str):
+    """Cancel a batch and revoke pending tasks."""
+    if batch_id not in batches:
+        raise HTTPException(status_code=404, detail="Batch not found")
+
+    batch = batches[batch_id]
+    group_result = GroupResult.restore(batch["group_id"], app=celery_app)
+
+    if group_result:
+        group_result.revoke(terminate=True)
+
+    del batches[batch_id]
+    return {"message": f"Batch {batch_id} cancelled"}
+
+
+@app.get("/queue/stats", tags=["System"])
+async def queue_stats():
+    """Get Celery queue statistics."""
+    inspect = celery_app.control.inspect()
+
+    try:
+        active = inspect.active() or {}
+        reserved = inspect.reserved() or {}
+        stats = inspect.stats() or {}
+
+        total_active = sum(len(tasks) for tasks in active.values())
+        total_reserved = sum(len(tasks) for tasks in reserved.values())
+
+        return {
+            "workers": list(stats.keys()),
+            "active_tasks": total_active,
+            "reserved_tasks": total_reserved,
+            "batches_in_memory": len(batches)
+        }
+    except Exception as e:
+        return {"error": str(e), "message": "Celery workers may not be running"}
+
+
 @app.get("/health", tags=["System"])
 async def health_check():
     """Health check endpoint."""
-    return {"status": "ok", "service": "cfdi-verifier", "version": "2.0.0"}
+    return {"status": "ok", "service": "cfdi-verifier", "version": "3.0.0"}
 
 
 if __name__ == "__main__":
