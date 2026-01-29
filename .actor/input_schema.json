@@ -1,0 +1,54 @@
+{
+    "title": "CFDI Verifier Input",
+    "description": "Input for verifying Mexican digital tax invoices (CFDI)",
+    "type": "object",
+    "schemaVersion": 1,
+    "properties": {
+        "xmlContent": {
+            "title": "XML Content",
+            "type": "string",
+            "description": "The CFDI XML content as a string",
+            "editor": "textarea"
+        },
+        "xmlUrl": {
+            "title": "XML URL",
+            "type": "string",
+            "description": "URL to download the CFDI XML file from",
+            "editor": "textfield"
+        },
+        "xmlFiles": {
+            "title": "XML Files",
+            "type": "array",
+            "description": "Array of XML file URLs or base64 encoded content",
+            "editor": "json",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string"
+                    },
+                    "content": {
+                        "type": "string"
+                    },
+                    "filename": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
+        "maxRetries": {
+            "title": "Max Retries",
+            "type": "integer",
+            "description": "Maximum number of retries if CAPTCHA fails",
+            "default": 3,
+            "minimum": 1,
+            "maximum": 10
+        },
+        "headless": {
+            "title": "Headless Mode",
+            "type": "boolean",
+            "description": "Run browser in headless mode",
+            "default": true
+        }
+    }
+}

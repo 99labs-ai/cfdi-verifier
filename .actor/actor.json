@@ -1,0 +1,53 @@
+{
+    "actorSpecification": 1,
+    "name": "cfdi-verifier",
+    "title": "CFDI Verifier (SAT Mexico)",
+    "description": "Verifies Mexican digital tax invoices (CFDI) against SAT's official verification service.",
+    "version": "1.0.0",
+    "buildTag": "latest",
+    "environmentVariables": {
+        "TWOCAPTCHA_API_KEY": {
+            "description": "Your 2Captcha API key for solving CAPTCHAs",
+            "isSecret": true
+        }
+    },
+    "dockerfile": "./Dockerfile",
+    "input": "./input_schema.json",
+    "storages": {
+        "dataset": {
+            "actorSpecification": 1,
+            "title": "CFDI Verification Results",
+            "views": {
+                "overview": {
+                    "title": "Overview",
+                    "transformation": {
+                        "fields": [
+                            "valid",
+                            "folio_fiscal",
+                            "rfc_emisor",
+                            "nombre_emisor",
+                            "rfc_receptor",
+                            "nombre_receptor",
+                            "total",
+                            "estado",
+                            "fecha_expedicion"
+                        ]
+                    },
+                    "display": {
+                        "component": "table",
+                        "properties": {
+                            "valid": {
+                                "label": "Valid",
+                                "format": "boolean"
+                            },
+                            "total": {
+                                "label": "Total",
+                                "format": "money"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

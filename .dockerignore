@@ -1,0 +1,12 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.gitignore
+*.md
+.env.example
+verify_cfdi.py
+verify_folio.py
+.actor/
+src/
