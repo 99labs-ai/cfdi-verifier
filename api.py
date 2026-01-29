@@ -1282,6 +1282,242 @@ async def get_stats(db: Session = Depends(get_db)):
     }
 
 
+# ---------- Cost Tracking ----------
+
+# Cost constants
+COST_2CAPTCHA_PER_SOLVE = 0.003  # $0.003 per CAPTCHA solve
+COST_CAPTCHA_RETRY_RATE = 1.2   # Average 1.2 solves per verification (20% retry rate)
+COST_DO_API_MONTHLY = 12.0      # DO App Platform Professional-xs
+COST_DO_WORKER_MONTHLY = 12.0   # DO App Platform Professional-xs
+COST_DO_POSTGRES_MONTHLY = 0.0  # Dev database is free
+COST_REDIS_MONTHLY = 0.0        # Redis Cloud free tier
+
+
+@app.get("/costs", tags=["Costs"])
+async def get_costs(db: Session = Depends(get_db)):
+    """
+    Get cost breakdown based on actual usage.
+
+    Returns costs for today, this month, and all-time.
+    """
+    from datetime import timedelta
+    from sqlalchemy import func
+
+    now = datetime.utcnow()
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    # Count verifications
+    total_all = db.query(Verification).count()
+    total_month = db.query(Verification).filter(Verification.created_at >= month_start).count()
+    total_today = db.query(Verification).filter(Verification.created_at >= today_start).count()
+
+    # Count completed (successful CAPTCHA solves)
+    completed_all = db.query(Verification).filter(Verification.status == VerificationStatus.COMPLETED).count()
+    completed_month = db.query(Verification).filter(
+        Verification.status == VerificationStatus.COMPLETED,
+        Verification.created_at >= month_start
+    ).count()
+    completed_today = db.query(Verification).filter(
+        Verification.status == VerificationStatus.COMPLETED,
+        Verification.created_at >= today_start
+    ).count()
+
+    # Count failed (also used CAPTCHA solves)
+    failed_all = db.query(Verification).filter(Verification.status == VerificationStatus.FAILED).count()
+    failed_month = db.query(Verification).filter(
+        Verification.status == VerificationStatus.FAILED,
+        Verification.created_at >= month_start
+    ).count()
+    failed_today = db.query(Verification).filter(
+        Verification.status == VerificationStatus.FAILED,
+        Verification.created_at >= today_start
+    ).count()
+
+    # Estimate CAPTCHA solves (completed + failed attempts, with retry rate)
+    def calc_captcha_cost(completed: int, failed: int) -> dict:
+        estimated_solves = int((completed + failed) * COST_CAPTCHA_RETRY_RATE)
+        captcha_cost = estimated_solves * COST_2CAPTCHA_PER_SOLVE
+        return {
+            "verifications": completed + failed,
+            "estimated_captcha_solves": estimated_solves,
+            "captcha_cost": round(captcha_cost, 2)
+        }
+
+    # Get 2Captcha balance
+    twocaptcha_balance = None
+    try:
+        api_key = os.getenv("TWOCAPTCHA_API_KEY")
+        if api_key:
+            solver = TwoCaptcha(api_key)
+            balance = solver.balance()
+            twocaptcha_balance = round(float(balance), 2)
+    except Exception as e:
+        logger.error(f"Failed to get 2Captcha balance: {e}")
+
+    return {
+        "today": calc_captcha_cost(completed_today, failed_today),
+        "month": calc_captcha_cost(completed_month, failed_month),
+        "all_time": calc_captcha_cost(completed_all, failed_all),
+        "twocaptcha_balance": twocaptcha_balance,
+        "rates": {
+            "cost_per_captcha": COST_2CAPTCHA_PER_SOLVE,
+            "avg_captchas_per_verification": COST_CAPTCHA_RETRY_RATE
+        }
+    }
+
+
+@app.get("/costs/estimate", tags=["Costs"])
+async def estimate_costs(
+    verifications: int = 100,
+    workers: int = 3,
+    include_infrastructure: bool = True
+):
+    """
+    Estimate costs for a given number of verifications.
+
+    - **verifications**: Number of CFDIs to verify
+    - **workers**: Number of Celery workers (affects infra cost)
+    - **include_infrastructure**: Include monthly infra costs (amortized)
+    """
+    # 2Captcha costs
+    estimated_solves = int(verifications * COST_CAPTCHA_RETRY_RATE)
+    captcha_cost = estimated_solves * COST_2CAPTCHA_PER_SOLVE
+
+    # Infrastructure costs (monthly, amortized per verification)
+    monthly_infra = COST_DO_API_MONTHLY + (COST_DO_WORKER_MONTHLY * workers) + COST_DO_POSTGRES_MONTHLY + COST_REDIS_MONTHLY
+
+    # Assume 10,000 verifications/month as baseline for amortization
+    baseline_monthly_volume = 10000
+    infra_per_verification = monthly_infra / baseline_monthly_volume
+    infra_cost_amortized = verifications * infra_per_verification
+
+    total_cost = captcha_cost
+    if include_infrastructure:
+        total_cost += infra_cost_amortized
+
+    # Processing time estimate
+    time_per_verification_seconds = 30
+    total_time_seconds = (verifications / workers) * time_per_verification_seconds
+    total_time_minutes = total_time_seconds / 60
+
+    return {
+        "input": {
+            "verifications": verifications,
+            "workers": workers,
+            "include_infrastructure": include_infrastructure
+        },
+        "captcha_costs": {
+            "estimated_solves": estimated_solves,
+            "cost_per_solve": COST_2CAPTCHA_PER_SOLVE,
+            "total": round(captcha_cost, 2)
+        },
+        "infrastructure_costs": {
+            "monthly_total": round(monthly_infra, 2),
+            "amortized_per_verification": round(infra_per_verification, 4),
+            "amortized_total": round(infra_cost_amortized, 2) if include_infrastructure else 0,
+            "baseline_monthly_volume": baseline_monthly_volume
+        },
+        "totals": {
+            "cost_per_verification": round(total_cost / verifications, 4) if verifications > 0 else 0,
+            "total_cost": round(total_cost, 2),
+            "estimated_time_minutes": round(total_time_minutes, 1)
+        }
+    }
+
+
+@app.get("/costs/infrastructure", tags=["Costs"])
+async def get_infrastructure_costs(
+    workers: int = 3,
+    monthly_volume: int = 10000,
+    postgres_tier: str = "dev",
+    redis_tier: str = "free"
+):
+    """
+    Get detailed infrastructure cost breakdown.
+
+    - **workers**: Number of Celery worker instances
+    - **monthly_volume**: Expected monthly verification volume
+    - **postgres_tier**: 'dev' (free), 'basic' ($15), 'production' ($50)
+    - **redis_tier**: 'free', 'basic' ($15), 'production' ($50)
+    """
+    # PostgreSQL pricing
+    postgres_costs = {
+        "dev": 0,
+        "basic": 15,
+        "production": 50
+    }
+
+    # Redis pricing
+    redis_costs = {
+        "free": 0,
+        "basic": 15,
+        "production": 50
+    }
+
+    postgres_cost = postgres_costs.get(postgres_tier, 0)
+    redis_cost = redis_costs.get(redis_tier, 0)
+
+    # Calculate monthly costs
+    api_cost = COST_DO_API_MONTHLY
+    worker_cost = COST_DO_WORKER_MONTHLY * workers
+
+    monthly_infra = api_cost + worker_cost + postgres_cost + redis_cost
+
+    # 2Captcha costs for volume
+    captcha_cost = monthly_volume * COST_CAPTCHA_RETRY_RATE * COST_2CAPTCHA_PER_SOLVE
+
+    monthly_total = monthly_infra + captcha_cost
+
+    # Per verification cost
+    cost_per_verification = monthly_total / monthly_volume if monthly_volume > 0 else 0
+
+    # Scaling recommendations
+    recommendations = []
+    if monthly_volume > 20000 and workers < 5:
+        recommendations.append("Consider adding more workers for faster processing")
+    if monthly_volume > 50000 and postgres_tier == "dev":
+        recommendations.append("Consider upgrading PostgreSQL to basic tier for better performance")
+    if monthly_volume > 100000:
+        recommendations.append("Consider dedicated infrastructure or horizontal scaling")
+
+    return {
+        "configuration": {
+            "workers": workers,
+            "monthly_volume": monthly_volume,
+            "postgres_tier": postgres_tier,
+            "redis_tier": redis_tier
+        },
+        "monthly_costs": {
+            "digitalocean": {
+                "api_service": round(api_cost, 2),
+                "worker_services": round(worker_cost, 2),
+                "postgresql": round(postgres_cost, 2),
+                "subtotal": round(api_cost + worker_cost + postgres_cost, 2)
+            },
+            "redis_cloud": round(redis_cost, 2),
+            "twocaptcha": round(captcha_cost, 2),
+            "total": round(monthly_total, 2)
+        },
+        "per_verification": {
+            "infrastructure": round((monthly_infra / monthly_volume) if monthly_volume > 0 else 0, 4),
+            "captcha": round(COST_CAPTCHA_RETRY_RATE * COST_2CAPTCHA_PER_SOLVE, 4),
+            "total": round(cost_per_verification, 4)
+        },
+        "annual_projection": {
+            "infrastructure": round(monthly_infra * 12, 2),
+            "captcha": round(captcha_cost * 12, 2),
+            "total": round(monthly_total * 12, 2)
+        },
+        "processing_capacity": {
+            "verifications_per_hour": workers * 120,  # ~30s per verification
+            "verifications_per_day": workers * 2880,
+            "max_monthly_capacity": workers * 86400   # 24/7 operation
+        },
+        "recommendations": recommendations
+    }
+
+
 @app.get("/health", tags=["System"])
 async def health_check():
     """Health check endpoint."""
